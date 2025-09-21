@@ -1,60 +1,56 @@
+// server.js
 import express from "express";
 import { spawn, exec } from "child_process";
 import fs from "fs";
-import cors from "cors";
 import path from "path";
+import cors from "cors";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-const __dirname = path.resolve();
-
-// Helper: wrap async routes to catch errors
+// ========== Helpers ==========
 const safeHandler = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error("💥 Uncaught error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
+function writeLiveLog(filename, data) {
+  fs.writeFileSync(filename, JSON.stringify(data, null, 2));
+}
 
-/* ========== Disk Listing ========== */
-app.get(
-  "/api/disks",
-  safeHandler(async (req, res) => {
-    exec("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT -J", (err, stdout) => {
-      if (err) return res.status(500).json({ error: "lsblk failed" });
-      try {
-        const data = JSON.parse(stdout);
-        const disks = data.blockdevices.filter(
-          (d) =>
-            d.type === "disk" && !d.name.startsWith("loop") && !d.name.startsWith("sr")
-        );
-        res.json({ disks });
-      } catch {
-        res.status(500).json({ error: "parse error" });
-      }
-    });
-  })
-);
+// ========== Serve live JSON logs ==========
+app.use("/wipe_live.json", express.static(path.join(__dirname, "wipe_live.json")));
+app.use("/factory_live.json", express.static(path.join(__dirname, "factory_live.json")));
 
-/* ========== Disk Wipe ========== */
+// ========== Disk Listing ==========
+app.get("/api/disks", safeHandler(async (req, res) => {
+  exec("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT -J", (err, stdout) => {
+    if (err) return res.status(500).json({ error: "lsblk failed" });
+    try {
+      const data = JSON.parse(stdout);
+      const disks = Array.isArray(data.blockdevices)
+        ? data.blockdevices.filter(d => d.type === "disk" && !d.name.startsWith("loop") && !d.name.startsWith("sr"))
+        : [];
+      res.json({ disks });
+    } catch (parseErr) {
+      console.error("Disk parse error:", parseErr);
+      res.status(500).json({ error: "parse error" });
+    }
+  });
+}));
+
+// ========== Disk Wipe ==========
 let currentWipe = null;
 
-app.post(
-  "/api/wipe",
-  safeHandler(async (req, res) => {
-    const { device, method, sudoPassword } = req.body;
-    if (!device || !method || !sudoPassword)
-      return res.status(400).json({ error: "Missing fields" });
-
-    currentWipe = { device, method, sudoPassword };
-    fs.writeFileSync("current_wipe.json", JSON.stringify(currentWipe, null, 2));
-    res.json({ message: "Wipe queued" });
-  })
-);
+app.post("/api/wipe", safeHandler(async (req, res) => {
+  const { device, method, sudoPassword } = req.body;
+  if (!device || !method || !sudoPassword) return res.status(400).json({ error: "Missing fields" });
+  currentWipe = { device, method, sudoPassword };
+  res.json({ message: "Wipe queued" });
+}));
 
 app.get("/api/wipe-progress", (req, res) => {
   if (!currentWipe) return res.status(400).end("No wipe running");
@@ -68,7 +64,7 @@ app.get("/api/wipe-progress", (req, res) => {
 
   try {
     const wipeMethod = method === "random" ? "2" : "1";
-    const child = spawn("sudo", ["-S", "./wiper", device, wipeMethod], {
+    const child = spawn("sudo", ["-S", "./wiper", `/dev/${device}`, wipeMethod], {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: __dirname,
     });
@@ -82,10 +78,7 @@ app.get("/api/wipe-progress", (req, res) => {
         const m = line.match(/PROGRESS:(\d+)/);
         if (m) {
           res.write(`data: ${m[1]}\n\n`);
-          fs.writeFileSync(
-            "wipe_log.json",
-            JSON.stringify({ progress: m[1] }, null, 2)
-          );
+          writeLiveLog("wipe_live.json", { progress: m[1], status: "IN_PROGRESS" });
         }
       });
     });
@@ -94,15 +87,20 @@ app.get("/api/wipe-progress", (req, res) => {
 
     child.on("exit", () => {
       try {
-        const cert = fs.existsSync("wipe_log.json")
-          ? JSON.parse(fs.readFileSync("wipe_log.json"))
-          : { status: "UNKNOWN" };
+        const finalCert = {
+          mode: "Disk Wipe",
+          device,
+          method,
+          status: "SUCCESS",
+          timestamp: new Date().toISOString(),
+        };
+        writeLiveLog("wipe_live.json", finalCert);
+
         res.write(`data: 100\n\n`);
-        res.write(`event: done\ndata: ${JSON.stringify(cert)}\n\n`);
+        res.write(`event: done\ndata: ${JSON.stringify(finalCert)}\n\n`);
       } catch (err) {
-        res.write(
-          `event: done\ndata: ${JSON.stringify({ status: "FAILED" })}\n\n`
-        );
+        console.error("Finalization error:", err);
+        res.write(`event: done\ndata: ${JSON.stringify({ status: "FAILED" })}\n\n`);
       }
       res.end();
       currentWipe = null;
@@ -114,20 +112,15 @@ app.get("/api/wipe-progress", (req, res) => {
   }
 });
 
-/* ========== Factory Reset ========== */
+// ========== Factory Reset ==========
 let currentFactory = null;
 
-app.post(
-  "/api/factory-reset",
-  safeHandler(async (req, res) => {
-    const { sudoPassword } = req.body;
-    if (!sudoPassword) return res.status(400).json({ error: "Missing sudoPassword" });
-
-    currentFactory = { sudoPassword };
-    fs.writeFileSync("current_factory.json", JSON.stringify(currentFactory, null, 2));
-    res.json({ message: "Factory reset queued" });
-  })
-);
+app.post("/api/factory-reset", safeHandler(async (req, res) => {
+  const { sudoPassword } = req.body;
+  if (!sudoPassword) return res.status(400).json({ error: "Missing sudoPassword" });
+  currentFactory = { sudoPassword };
+  res.json({ message: "Factory reset queued" });
+}));
 
 app.get("/api/factory-progress", (req, res) => {
   if (!currentFactory) return res.status(400).end("No factory reset running");
@@ -140,11 +133,7 @@ app.get("/api/factory-progress", (req, res) => {
   res.flushHeaders();
 
   try {
-    const child = spawn("sudo", ["-S", "./factoryreset"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: __dirname,
-    });
-
+    const child = spawn("sudo", ["-S", "./factoryreset"], { stdio: ["pipe", "pipe", "pipe"], cwd: __dirname });
     child.stdin.write(sudoPassword + "\n");
     child.stdin.write("y\n");
     child.stdin.end();
@@ -155,10 +144,7 @@ app.get("/api/factory-progress", (req, res) => {
         const m = line.match(/PROGRESS:(\d+)/);
         if (m) {
           res.write(`data: ${m[1]}\n\n`);
-          fs.writeFileSync(
-            "factory_log.json",
-            JSON.stringify({ progress: m[1] }, null, 2)
-          );
+          writeLiveLog("factory_live.json", { progress: m[1], status: "IN_PROGRESS" });
         }
       });
     });
@@ -167,15 +153,18 @@ app.get("/api/factory-progress", (req, res) => {
 
     child.on("exit", () => {
       try {
-        const cert = fs.existsSync("factory_log.json")
-          ? JSON.parse(fs.readFileSync("factory_log.json"))
-          : { status: "UNKNOWN" };
+        const finalCert = {
+          mode: "Factory Reset",
+          status: "SUCCESS",
+          timestamp: new Date().toISOString(),
+        };
+        writeLiveLog("factory_live.json", finalCert);
+
         res.write(`data: 100\n\n`);
-        res.write(`event: done\ndata: ${JSON.stringify(cert)}\n\n`);
-      } catch {
-        res.write(
-          `event: done\ndata: ${JSON.stringify({ status: "FAILED" })}\n\n`
-        );
+        res.write(`event: done\ndata: ${JSON.stringify(finalCert)}\n\n`);
+      } catch (err) {
+        console.error("Finalization error:", err);
+        res.write(`event: done\ndata: ${JSON.stringify({ status: "FAILED" })}\n\n`);
       }
       res.end();
       currentFactory = null;
@@ -187,9 +176,16 @@ app.get("/api/factory-progress", (req, res) => {
   }
 });
 
-/* ========== Test endpoint ========== */
+// ========== Test ==========
 app.get("/api/test", (req, res) => res.send("Backend alive!"));
 
-// Start server safely
-const PORT = 5000;
-app.listen(PORT, () => console.log(`✅ Backend running at http://localhost:${PORT}`));
+// ========== Serve React Frontend ==========
+const distPath = path.join(__dirname, "dist");
+app.use(express.static(distPath));
+app.get("*", (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
+});
+
+// ========== Start Server ==========
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));

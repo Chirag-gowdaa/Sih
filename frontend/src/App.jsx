@@ -1,271 +1,232 @@
 import React, { useState, useEffect, useRef } from "react";
 import jsPDF from "jspdf";
 
+const API_BASE = "http://localhost:5000";
+
 const App = () => {
-  const [task, setTask] = useState("");
   const [disks, setDisks] = useState([]);
-  const [selectedDisk, setSelectedDisk] = useState(null);
+  const [selectedDisk, setSelectedDisk] = useState("");
+  const [taskType, setTaskType] = useState("wipe"); // "wipe" or "factory"
   const [method, setMethod] = useState("zero");
   const [progress, setProgress] = useState(0);
-  const [logs, setLogs] = useState([]);
+  const [log, setLog] = useState([]);
   const [certificate, setCertificate] = useState(null);
+  const logRef = useRef(null);
   const [sudoPassword, setSudoPassword] = useState("");
-  const [confirm, setConfirm] = useState(false);
-  const [jsonLog, setJsonLog] = useState(null);
-
-  const logsRef = useRef();
-
-  // Fetch disks on load
-  useEffect(() => {
-    fetch("http://localhost:5000/api/disks")
-      .then((res) => res.json())
-      .then((data) => setDisks(data.disks || []))
-      .catch((err) => setLogs((prev) => [...prev, `❌ Disk fetch failed`]));
-  }, []);
 
   // Auto-scroll logs
   useEffect(() => {
-    if (logsRef.current) {
-      logsRef.current.scrollTop = logsRef.current.scrollHeight;
-    }
-  }, [logs]);
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log]);
 
-  const handleAction = async () => {
-    if (!task) return alert("Choose an action");
-    if (!sudoPassword) return alert("Enter admin password");
-    if (task === "wipe" && !selectedDisk) return alert("Select a disk");
+  // Fetch disks
+  useEffect(() => {
+    const fetchDisks = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/disks`);
+        const data = await res.json();
+        setDisks(data.disks || []);
+      } catch (err) {
+        setLog((prev) => [...prev, "❌ Failed to fetch disks"]);
+      }
+    };
+    fetchDisks();
+  }, []);
+
+  // Start Task
+  const handleStart = async () => {
+    if (taskType === "wipe" && !selectedDisk) {
+      setLog((prev) => [...prev, "❌ Please select a disk"]);
+      return;
+    }
+    if (!sudoPassword) {
+      setLog((prev) => [...prev, "❌ Please enter sudo password"]);
+      return;
+    }
 
     setProgress(0);
-    setLogs([]);
+    setLog((prev) => [
+      ...prev,
+      `▶️ Started ${taskType === "wipe" ? "Disk Wipe" : "Factory Reset"}`
+    ]);
     setCertificate(null);
-    setJsonLog(null);
+
+    const endpoint =
+      taskType === "wipe" ? "/api/wipe" : "/api/factory-reset";
 
     try {
-      const url =
-        task === "wipe"
-          ? "http://localhost:5000/api/wipe"
-          : "http://localhost:5000/api/factory-reset";
-
-      const body =
-        task === "wipe"
-          ? { device: `/dev/${selectedDisk.name}`, method, sudoPassword }
-          : { sudoPassword };
-
-      await fetch(url, {
+      const res = await fetch(`${API_BASE}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify(
+          taskType === "wipe"
+            ? { device: selectedDisk, method, sudoPassword }
+            : { sudoPassword }
+        )
       });
 
-      startSSE(task === "wipe" ? "/api/wipe-progress" : "/api/factory-progress");
+      if (!res.ok) throw new Error("Failed to start task");
+
+      // SSE connection
+      const progressEndpoint =
+        taskType === "wipe" ? "/api/wipe-progress" : "/api/factory-progress";
+
+      const evtSource = new EventSource(`${API_BASE}${progressEndpoint}?_=${Date.now()}`);
+
+      evtSource.onmessage = (e) => {
+        const val = parseInt(e.data);
+        if (!isNaN(val)) setProgress(val);
+      };
+
+      evtSource.addEventListener("done", (e) => {
+        const data = JSON.parse(e.data);
+        setLog((prev) => [...prev, `✅ Task Completed: ${data.status}`]);
+        setCertificate(data);
+        setProgress(100);
+        evtSource.close();
+      });
+
+      evtSource.onerror = (err) => {
+        setLog((prev) => [...prev, "❌ SSE connection error"]);
+        evtSource.close();
+      };
     } catch (err) {
-      setLogs((prev) => [...prev, `❌ Error: ${err.message}`]);
+      setLog((prev) => [...prev, "❌ Error starting task"]);
     }
   };
 
-  const startSSE = (path) => {
-    const evt = new EventSource(`http://localhost:5000${path}`);
-    let lastProgress = 0;
-
-    evt.onmessage = (e) => {
-      const val = Number(e.data);
-      lastProgress = val;
-      setProgress(val);
-      setLogs((prev) => [...prev, `Progress: ${val}%`]);
-
-      // fetch live JSON log
-      fetch(
-        task === "wipe"
-          ? "http://localhost:5000/wipe_live.json"
-          : "http://localhost:5000/factory_live.json"
-      )
-        .then((res) => res.json())
-        .then((json) => setJsonLog(json));
-    };
-
-    evt.addEventListener("done", (e) => {
-      try {
-        const cert = JSON.parse(e.data);
-        setCertificate(cert);
-        setLogs((prev) => [...prev, "✅ Operation completed"]);
-      } catch {
-        setCertificate({ status: "OK" });
-      }
-      setProgress(100);
-      evt.close();
-    });
-
-    evt.onerror = () => {
-      setLogs((prev) => [...prev, "❌ SSE connection error"]);
-      evt.close();
-    };
-  };
-
-  const downloadPDF = () => {
+  // Generate PDF
+  const handleDownloadPDF = () => {
     if (!certificate) return;
     const doc = new jsPDF();
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(18);
-    doc.text("🔐 Certificate of Secure Erasure", 20, 20);
-
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(12);
-
-    let y = 40;
-    Object.entries(certificate).forEach(([key, value]) => {
-      doc.text(`${key}: ${value}`, 20, y);
-      y += 10;
-    });
-
-    doc.setFontSize(10);
-    doc.text("Generated by SIH Secure Wiper Tool", 20, y + 20);
+    doc.text("Data Wiping / Factory Reset Certificate", 20, 20);
+    if (certificate.device) doc.text(`Disk: ${certificate.device}`, 20, 40);
+    if (certificate.method) doc.text(`Method: ${certificate.method}`, 20, 50);
+    doc.text(`Status: ${certificate.status}`, 20, 60);
+    doc.text(`Timestamp: ${new Date().toLocaleString()}`, 20, 70);
     doc.save("certificate.pdf");
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white p-10 font-sans">
-      <h1 className="text-4xl font-bold mb-8 text-center text-green-400">
-        🔐 SIH Secure Disk Wiper
-      </h1>
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-blue-100 flex items-center justify-center p-6">
+      <div className="w-full max-w-3xl bg-white rounded-2xl shadow-lg p-8 space-y-6">
+        <h1 className="text-2xl font-bold text-gray-800 text-center">
+          Secure Disk Wiper
+        </h1>
 
-      {/* Task Selection */}
-      <div className="mb-6">
-        <label className="font-semibold">Choose Action:</label>
-        <select
-          value={task}
-          onChange={(e) => {
-            setTask(e.target.value);
-            setConfirm(false);
-            setSelectedDisk(null);
-          }}
-          className="ml-3 p-2 rounded bg-slate-700 border border-slate-600"
-        >
-          <option value="">-- choose --</option>
-          <option value="wipe">💀 Disk Wipe (DESTROYS OS)</option>
-          <option value="factory">♻️ Factory Reset</option>
-        </select>
-      </div>
+        {/* Sudo Password */}
+        <div className="space-y-2">
+          <label className="block text-gray-700 font-medium">Sudo Password</label>
+          <input
+            type="password"
+            value={sudoPassword}
+            onChange={(e) => setSudoPassword(e.target.value)}
+            placeholder="Enter sudo password"
+            className="w-full border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
+          />
+        </div>
 
-      {/* Disk List */}
-      {task === "wipe" && (
-        <div className="mb-6">
-          <p className="font-semibold mb-2">Available Disks:</p>
-          <div className="grid grid-cols-2 gap-4">
-            {disks.map((d) => (
-              <div
-                key={d.name}
-                onClick={() => setSelectedDisk(d)}
-                className={`p-4 rounded-xl cursor-pointer transition ${
-                  selectedDisk?.name === d.name
-                    ? "bg-green-700"
-                    : "bg-slate-700 hover:bg-slate-600"
-                }`}
+        {/* Task Type */}
+        <div className="space-y-2">
+          <label className="block text-gray-700 font-medium">Task Type</label>
+          <select
+            value={taskType}
+            onChange={(e) => setTaskType(e.target.value)}
+            className="w-full border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
+          >
+            <option value="wipe">Disk Wipe</option>
+            <option value="factory">Factory Reset</option>
+          </select>
+        </div>
+
+
+        {/* Disk Selection (if wipe) */}
+        {taskType === "wipe" && (
+          <>
+            <div className="space-y-2">
+              <label className="block text-gray-700 font-medium">Select Disk</label>
+              <select
+                value={selectedDisk}
+                onChange={(e) => setSelectedDisk(e.target.value)}
+                className="w-full border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
               >
-                <h3 className="font-bold text-lg">/dev/{d.name}</h3>
-                <p className="text-sm">{d.size}</p>
-                <p className="text-xs text-slate-300">{d.type}</p>
-              </div>
+                <option value="" disabled>-- Choose a Disk --</option>
+                {disks.length > 0 ? (
+                  disks.map((disk, idx) => (
+                    <option key={idx} value={disk.name}>
+                      {disk.name} ({disk.size})
+                    </option>
+                  ))
+                ) : (
+                  <option disabled>No disks found</option>
+                )}
+              </select>
+            </div>
+
+            {/* Method */}
+            <div className="space-y-2">
+              <label className="block text-gray-700 font-medium">Wipe Method</label>
+              <select
+                value={method}
+                onChange={(e) => setMethod(e.target.value)}
+                className="w-full border rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
+              >
+                <option value="zero">Zero Fill</option>
+                <option value="random">Random Data</option>
+                <option value="dod">DoD 5220.22-M</option>
+              </select>
+            </div>
+          </>
+        )}
+
+        {/* Start Button */}
+        <button
+          onClick={handleStart}
+          className="w-full py-2 rounded-lg bg-green-500 text-white font-semibold hover:bg-green-600 transition disabled:opacity-50"
+        >
+          Start {taskType === "wipe" ? "Disk Wipe" : "Factory Reset"}
+        </button>
+
+        {/* Progress */}
+        <div className="w-full bg-gray-200 rounded-lg h-6 relative">
+          <div
+            className="bg-green-500 h-6 rounded-lg transition-all duration-500 ease-in-out flex items-center justify-center text-white text-sm font-medium"
+            style={{ width: `${progress}%` }}
+          >
+            {progress > 0 && <span className="absolute">{progress}%</span>}
+          </div>
+        </div>
+
+        {/* Logs */}
+        <div className="space-y-2">
+          <h2 className="text-lg font-semibold text-gray-800">Logs</h2>
+          <div
+            ref={logRef}
+            className="h-40 overflow-y-auto border rounded-lg p-3 bg-gray-50 text-sm text-gray-700"
+          >
+            {log.map((entry, idx) => (
+              <div key={idx}>• {entry}</div>
             ))}
           </div>
+        </div>
 
-          {/* Method */}
-          <div className="mt-4">
-            <label className="font-semibold">Method:</label>
-            <select
-              value={method}
-              onChange={(e) => setMethod(e.target.value)}
-              className="ml-3 p-2 rounded bg-slate-700 border border-slate-600"
+        {/* Certificate */}
+        {certificate && (
+          <div className="border rounded-xl p-4 bg-green-50 shadow-sm space-y-3">
+            <h2 className="text-lg font-semibold text-green-700">Certificate</h2>
+            {certificate.device && <p className="text-sm text-gray-700">Disk: {certificate.device}</p>}
+            {certificate.method && <p className="text-sm text-gray-700">Method: {certificate.method}</p>}
+            <p className="text-sm text-gray-700">Status: {certificate.status}</p>
+            <p className="text-sm text-gray-700">Timestamp: {new Date().toLocaleString()}</p>
+            <button
+              onClick={handleDownloadPDF}
+              className="mt-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition"
             >
-              <option value="zero">⚡ Zero-fill (Quick)</option>
-              <option value="random">🎲 Random Overwrite (Secure)</option>
-            </select>
+              Download PDF
+            </button>
           </div>
-        </div>
-      )}
-
-      {/* Password */}
-      <div className="mb-6">
-        <label className="font-semibold">Admin Password:</label>
-        <input
-          type="password"
-          value={sudoPassword}
-          onChange={(e) => setSudoPassword(e.target.value)}
-          className="ml-3 p-2 rounded bg-slate-700 border border-slate-600"
-        />
+        )}
       </div>
-
-      {/* Confirm + Start */}
-      {task === "wipe" && selectedDisk && !confirm && (
-        <button
-          onClick={() => setConfirm(true)}
-          className="bg-red-600 px-6 py-2 rounded-lg font-semibold hover:bg-red-500"
-        >
-          ⚠️ Confirm Wipe {selectedDisk.name}
-        </button>
-      )}
-
-      {confirm && (
-        <button
-          onClick={handleAction}
-          disabled={progress > 0 && progress < 100}
-          className="bg-green-600 px-6 py-2 rounded-lg font-semibold hover:bg-green-500 ml-2"
-        >
-          {progress > 0 && progress < 100 ? "Running..." : "Start Now"}
-        </button>
-      )}
-
-      {/* Progress */}
-      {progress > 0 && (
-        <div className="mt-6">
-          <div className="w-full bg-slate-700 rounded-full h-4">
-            <div
-              className="bg-green-500 h-4 rounded-full transition-all"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-          <p className="text-center mt-2">{progress}%</p>
-        </div>
-      )}
-
-      {/* Logs */}
-      {logs.length > 0 && (
-        <div
-          ref={logsRef}
-          className="mt-6 bg-slate-800 p-4 rounded-lg h-40 overflow-y-auto text-sm"
-        >
-          {logs.map((log, i) => (
-            <div key={i}>{log}</div>
-          ))}
-        </div>
-      )}
-
-      {/* JSON Live Log */}
-      {jsonLog && (
-        <div className="mt-6 bg-slate-800 p-4 rounded-lg">
-          <h3 className="font-semibold text-green-400 mb-2">Live JSON Log</h3>
-          <pre className="text-xs overflow-x-auto">
-            {JSON.stringify(jsonLog, null, 2)}
-          </pre>
-        </div>
-      )}
-
-      {/* Certificate */}
-      {certificate && (
-        <div className="mt-6 bg-slate-800 p-6 rounded-lg border border-green-600">
-          <h2 className="text-xl font-bold text-green-400 mb-3">
-            ✅ Certificate of Erasure
-          </h2>
-          <pre className="text-sm bg-slate-900 p-4 rounded-lg overflow-x-auto">
-            {JSON.stringify(certificate, null, 2)}
-          </pre>
-          <button
-            onClick={downloadPDF}
-            className="mt-4 bg-blue-600 px-4 py-2 rounded-lg font-semibold hover:bg-blue-500"
-          >
-            Download Certificate
-          </button>
-        </div>
-      )}
     </div>
   );
 };
